@@ -210,7 +210,8 @@ export const registerActivity = asyncHandler(async (req: AuthRequest, res: Respo
   }
 
   const actualCount = participant_count || 1;
-  const isWaitlist = activity.max_participants && activity.registered_count >= activity.max_participants;
+  const remainingQuota = activity.max_participants ? activity.max_participants - activity.registered_count : null;
+  const isWaitlist = remainingQuota !== null && remainingQuota < actualCount;
 
   let waitlistPosition: number | null = null;
   if (isWaitlist) {

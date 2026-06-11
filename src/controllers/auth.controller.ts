@@ -5,6 +5,7 @@ import { get, run } from '../database';
 import { successResponse, ApiError, asyncHandler } from '../utils/response';
 import { AuthRequest } from '../middlewares/auth.middleware';
 import { sendMessage } from '../services/message.service';
+import dayjs from 'dayjs';
 
 export const register = asyncHandler(async (req: Request, res: Response) => {
   const { username, password, real_name, phone, id_card } = req.body;
@@ -44,6 +45,12 @@ export const register = asyncHandler(async (req: Request, res: Response) => {
 
   const token = generateToken(userId as number, username, user?.role || 'user');
 
+  const expiresAt = dayjs().add(7, 'day').format('YYYY-MM-DD HH:mm:ss');
+  await run(
+    `INSERT INTO access_tokens (user_id, token, source, expires_at) VALUES (?, ?, ?, ?)`,
+    [userId, token, 'web', expiresAt]
+  );
+
   successResponse(res, {
     user,
     token
@@ -73,10 +80,10 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
 
   const token = generateToken(user.id, user.username, user.role);
 
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  const expiresAt = dayjs().add(7, 'day').format('YYYY-MM-DD HH:mm:ss');
   await run(
     `INSERT INTO access_tokens (user_id, token, source, expires_at) VALUES (?, ?, ?, ?)`,
-    [user.id, token, source, expiresAt.toISOString()]
+    [user.id, token, source, expiresAt]
   );
 
   const userInfo = {

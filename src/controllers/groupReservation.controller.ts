@@ -39,6 +39,32 @@ export const createGroupReservation = asyncHandler(async (req: AuthRequest, res:
     throw new ApiError(400, '该时段名额不足，请选择其他时段', 'quota_insufficient');
   }
 
+  const calendarSetting = await get(
+    'SELECT is_open, daily_limit FROM calendar_settings WHERE venue_id = ? AND date = ?',
+    [timeSlot.venue_id, timeSlot.date]
+  );
+
+  if (calendarSetting && calendarSetting.is_open === 0) {
+    throw new ApiError(400, '该日期场馆不开放', 'invalid_operation');
+  }
+
+  if (calendarSetting && calendarSetting.daily_limit) {
+    const dayTotal = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE venue_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [timeSlot.venue_id, timeSlot.date]
+    );
+    const dayGroupTotal = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE venue_id = ? AND date = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [timeSlot.venue_id, timeSlot.date]
+    );
+    const currentDayCount = (dayTotal?.total || 0) + (dayGroupTotal?.total || 0);
+    if (currentDayCount + total_people > calendarSetting.daily_limit) {
+      throw new ApiError(400, `该日预约人数已达上限(${calendarSetting.daily_limit}人)，请选择其他日期`, 'daily_limit_exceeded');
+    }
+  }
+
   const groupNo = generateReservationNo('G');
   const ticketCode = generateTicketCode();
 
@@ -145,6 +171,10 @@ export const cancelGroupReservation = asyncHandler(async (req: AuthRequest, res:
     throw new ApiError(400, '预约已取消', 'invalid_operation');
   }
 
+  if (groupReservation.status === 'rejected') {
+    throw new ApiError(400, '预约已被驳回，无需取消', 'invalid_operation');
+  }
+
   if (groupReservation.checkin_time) {
     throw new ApiError(400, '已签到的预约不能取消', 'invalid_operation');
   }
@@ -154,7 +184,7 @@ export const cancelGroupReservation = asyncHandler(async (req: AuthRequest, res:
     ['cancelled', id]
   );
 
-  if (groupReservation.audit_status === 'approved' || groupReservation.status === 'confirmed') {
+  if (groupReservation.audit_status !== 'rejected') {
     await run(
       'UPDATE time_slots SET reserved_count = reserved_count - ? WHERE id = ?',
       [groupReservation.total_people, groupReservation.time_slot_id]
@@ -184,17 +214,7 @@ export const auditGroupReservation = asyncHandler(async (req: AuthRequest, res: 
     throw new ApiError(400, '该预约已审核，请勿重复操作', 'invalid_operation');
   }
 
-  const timeSlot = await get('SELECT * FROM time_slots WHERE id = ?', [groupReservation.time_slot_id]);
-
   if (audit_status === 'approved') {
-    const availableQuota = timeSlot.total_quota - timeSlot.reserved_count;
-    if (availableQuota < 0) {
-      await run(
-        'UPDATE time_slots SET reserved_count = reserved_count - ? WHERE id = ?',
-        [Math.abs(availableQuota) + groupReservation.total_people, groupReservation.time_slot_id]
-      );
-    }
-
     await run(
       `UPDATE group_reservations 
        SET audit_status = ?, audit_by = ?, audit_time = CURRENT_TIMESTAMP, 

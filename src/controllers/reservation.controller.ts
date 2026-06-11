@@ -32,6 +32,24 @@ export const createReservation = asyncHandler(async (req: AuthRequest, res: Resp
     throw new ApiError(400, '该日期场馆不开放', 'invalid_operation');
   }
 
+  if (calendarSetting && calendarSetting.daily_limit) {
+    const dayTotal = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE venue_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [timeSlot.venue_id, timeSlot.date]
+    );
+    const dayGroupTotal = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE venue_id = ? AND date = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [timeSlot.venue_id, timeSlot.date]
+    );
+    const currentDayCount = (dayTotal?.total || 0) + (dayGroupTotal?.total || 0);
+    const actualCount = visitor_count || 1;
+    if (currentDayCount + actualCount > calendarSetting.daily_limit) {
+      throw new ApiError(400, `该日预约人数已达上限(${calendarSetting.daily_limit}人)，请选择其他日期`, 'daily_limit_exceeded');
+    }
+  }
+
   const todayReservations = await get(
     `SELECT COUNT(*) as count FROM reservations 
      WHERE user_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,

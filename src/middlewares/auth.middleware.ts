@@ -22,6 +22,15 @@ export const authMiddleware = async (req: AuthRequest, res: Response, next: Next
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret') as any;
 
+    const tokenRecord = await get(
+      "SELECT id FROM access_tokens WHERE token = ? AND expires_at > datetime('now')",
+      [token]
+    );
+
+    if (!tokenRecord) {
+      throw new ApiError(401, '登录凭证已失效，请重新登录', 'token_invalid');
+    }
+
     const user = await get(
       'SELECT id, username, real_name, role, status FROM users WHERE id = ?',
       [decoded.userId]
