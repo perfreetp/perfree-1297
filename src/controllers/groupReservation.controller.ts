@@ -357,21 +357,91 @@ export const importGroupMembers = asyncHandler(async (req: AuthRequest, res: Res
     throw new ApiError(400, '成员列表不能为空', 'invalid_params');
   }
 
+  const newTotal = members.length;
+  if (typeof newTotal !== 'number' || !Number.isInteger(newTotal) || newTotal <= 0) {
+    throw new ApiError(400, `人数不合法：${newTotal}，必须是正整数`, 'invalid_visitor_count');
+  }
+  if (newTotal > 500) {
+    throw new ApiError(400, `人数不合法：超过上限(500人)`, 'invalid_visitor_count');
+  }
+  if (newTotal < 5) {
+    throw new ApiError(400, '团体预约至少需要5人', 'invalid_params');
+  }
+
   const groupReservation = await get('SELECT * FROM group_reservations WHERE id = ? AND user_id = ?', [id, req.user!.id]);
   if (!groupReservation) {
     throw new ApiError(404, '团体预约不存在', 'not_found');
   }
 
+  if (groupReservation.status === 'cancelled') {
+    throw new ApiError(400, '该预约已取消，无法导入成员', 'invalid_operation');
+  }
+  if (groupReservation.audit_status === 'rejected') {
+    throw new ApiError(400, '该预约已被驳回，无法导入成员', 'invalid_operation');
+  }
+
+  const oldTotal = groupReservation.total_people || 0;
+  const delta = newTotal - oldTotal;
+
+  if (delta > 0) {
+    const timeSlot = await get('SELECT * FROM time_slots WHERE id = ?', [groupReservation.time_slot_id]);
+    if (!timeSlot) {
+      throw new ApiError(404, '时段不存在', 'not_found');
+    }
+    if (timeSlot.status !== 1) {
+      throw new ApiError(400, '该时段不可预约', 'invalid_operation');
+    }
+
+    const availableQuota = timeSlot.total_quota - timeSlot.reserved_count - timeSlot.waitlist_count;
+    if (availableQuota < delta) {
+      throw new ApiError(400, `该时段剩余名额不足（剩余${availableQuota}人，需增加${delta}人）`, 'quota_insufficient');
+    }
+
+    const calendarSetting = await get(
+      'SELECT is_open, daily_limit FROM calendar_settings WHERE venue_id = ? AND date = ?',
+      [groupReservation.venue_id, groupReservation.date]
+    );
+    if (calendarSetting && calendarSetting.daily_limit) {
+      const dayTotal = await get(
+        `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+         WHERE venue_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,
+        [groupReservation.venue_id, groupReservation.date]
+      );
+      const dayGroupTotal = await get(
+        `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+         WHERE venue_id = ? AND date = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected' AND id != ?`,
+        [groupReservation.venue_id, groupReservation.date, groupReservation.id]
+      );
+      const otherGroups = (dayGroupTotal?.total || 0);
+      const currentDayCount = (dayTotal?.total || 0) + otherGroups + newTotal;
+      if (currentDayCount > calendarSetting.daily_limit) {
+        throw new ApiError(400, `该日预约人数已达上限(${calendarSetting.daily_limit}人)，当前合计${currentDayCount}人，无法再增加`, 'daily_limit_exceeded');
+      }
+    }
+
+    await run(
+      'UPDATE time_slots SET reserved_count = reserved_count + ? WHERE id = ?',
+      [delta, groupReservation.time_slot_id]
+    );
+  } else if (delta < 0) {
+    const release = -delta;
+    await run(
+      'UPDATE time_slots SET reserved_count = MAX(0, reserved_count - ?) WHERE id = ?',
+      [release, groupReservation.time_slot_id]
+    );
+  }
+
   const memberList = JSON.stringify(members);
   await run(
     'UPDATE group_reservations SET member_list = ?, total_people = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-    [memberList, members.length, id]
+    [memberList, newTotal, id]
   );
 
   const updated = await get('SELECT * FROM group_reservations WHERE id = ?', [id]);
   if (updated && updated.member_list) {
     updated.member_list = JSON.parse(updated.member_list);
   }
+  updated.people_delta = delta;
 
-  successResponse(res, updated, '导入成功');
+  successResponse(res, updated, `导入成功，人数 ${oldTotal} → ${newTotal}`);
 });
