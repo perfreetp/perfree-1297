@@ -177,6 +177,15 @@ export const registerActivity = asyncHandler(async (req: AuthRequest, res: Respo
     throw new ApiError(400, '缺少必要参数', 'invalid_params');
   }
 
+  if (participant_count !== undefined && participant_count !== null) {
+    if (typeof participant_count !== 'number' || !Number.isInteger(participant_count) || participant_count <= 0) {
+      throw new ApiError(400, `人数不合法：${participant_count}，必须是正整数`, 'invalid_participant_count');
+    }
+    if (participant_count > 200) {
+      throw new ApiError(400, `人数不合法：超过上限(200人)`, 'invalid_participant_count');
+    }
+  }
+
   const activity = await get('SELECT * FROM activities WHERE id = ?', [activity_id]);
   if (!activity) {
     throw new ApiError(404, '活动不存在', 'not_found');

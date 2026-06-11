@@ -368,7 +368,7 @@ export const getPendingAudits = asyncHandler(async (req: AuthRequest, res: Respo
        FROM group_reservations gr
        LEFT JOIN users u ON gr.user_id = u.id
        LEFT JOIN venues v ON gr.venue_id = v.id
-       WHERE gr.audit_status = 'pending'
+       WHERE gr.audit_status = 'pending' AND gr.status != 'cancelled'
        ORDER BY gr.created_at DESC
        LIMIT 20`,
       []
@@ -453,4 +453,460 @@ export const getVenueUtilization = asyncHandler(async (req: AuthRequest, res: Re
     utilization,
     date_range: { start_date: startDate, end_date: endDate }
   });
+});
+
+export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { venue_id, start_date, end_date } = req.query;
+
+  const startDate = start_date || dayjs().subtract(30, 'day').format('YYYY-MM-DD');
+  const endDate = end_date || dayjs().format('YYYY-MM-DD');
+
+  let venueCondition = '';
+  let params: any[] = [startDate, endDate];
+
+  if (venue_id) {
+    venueCondition = ' AND r.venue_id = ?';
+    params.push(venue_id);
+  }
+
+  const personalBySource = await all(
+    `SELECT 
+       r.source,
+       COUNT(*) as total_count,
+       SUM(CASE WHEN r.is_waitlist = 0 THEN 1 ELSE 0 END) as reservation_count,
+       SUM(CASE WHEN r.is_waitlist = 0 THEN r.visitor_count ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN r.status = 'cancelled' THEN 1 ELSE 0 END) as cancel_count,
+       SUM(CASE WHEN r.status = 'cancelled' THEN r.visitor_count ELSE 0 END) as cancel_people,
+       SUM(CASE WHEN r.is_waitlist = 1 THEN 1 ELSE 0 END) as waitlist_count,
+       SUM(CASE WHEN r.is_waitlist = 1 THEN r.visitor_count ELSE 0 END) as waitlist_people,
+       SUM(CASE WHEN r.checked_in = 1 THEN 1 ELSE 0 END) as checkin_count,
+       SUM(CASE WHEN r.checked_in = 1 THEN r.visitor_count ELSE 0 END) as checkin_people
+     FROM reservations r
+     WHERE r.date >= ? AND r.date <= ?${venueCondition}
+     GROUP BY r.source`,
+    params
+  );
+
+  let groupParams: any[] = [startDate, endDate];
+  let groupVenueCondition = '';
+  if (venue_id) {
+    groupVenueCondition = ' AND gr.venue_id = ?';
+    groupParams.push(venue_id);
+  }
+
+  const groupBySource = await all(
+    `SELECT 
+       gr.source,
+       COUNT(*) as group_count,
+       SUM(gr.total_people) as group_people,
+       SUM(CASE WHEN gr.status = 'cancelled' THEN 1 ELSE 0 END) as group_cancel_count,
+       SUM(CASE WHEN gr.status = 'cancelled' THEN gr.total_people ELSE 0 END) as group_cancel_people,
+       SUM(CASE WHEN gr.checked_in_count IS NOT NULL THEN gr.checked_in_count ELSE 0 END) as group_checkin_people
+     FROM group_reservations gr
+     WHERE gr.date >= ? AND gr.date <= ?${groupVenueCondition}
+     GROUP BY gr.source`,
+    groupParams
+  );
+
+  const sourceMap: Record<string, any> = {};
+  const sourceLabels: Record<string, string> = {
+    web: '官网',
+    miniapp: '小程序',
+    kiosk: '自助机',
+    backend: '后台管理',
+    admin: '后台管理'
+  };
+
+  for (const label of ['web', 'miniapp', 'kiosk', 'backend']) {
+    sourceMap[label] = {
+      source: label,
+      source_name: sourceLabels[label] || label,
+      reservation_count: 0,
+      reservation_people: 0,
+      group_count: 0,
+      group_people: 0,
+      cancel_count: 0,
+      cancel_people: 0,
+      waitlist_count: 0,
+      waitlist_people: 0,
+      checkin_count: 0,
+      checkin_people: 0
+    };
+  }
+
+  for (const row of personalBySource) {
+    const s = row.source || 'web';
+    if (!sourceMap[s]) {
+      sourceMap[s] = {
+        source: s,
+        source_name: sourceLabels[s] || s,
+        reservation_count: 0,
+        reservation_people: 0,
+        group_count: 0,
+        group_people: 0,
+        cancel_count: 0,
+        cancel_people: 0,
+        waitlist_count: 0,
+        waitlist_people: 0,
+        checkin_count: 0,
+        checkin_people: 0
+      };
+    }
+    sourceMap[s].reservation_count += row.reservation_count || 0;
+    sourceMap[s].reservation_people += row.reservation_people || 0;
+    sourceMap[s].cancel_count += row.cancel_count || 0;
+    sourceMap[s].cancel_people += row.cancel_people || 0;
+    sourceMap[s].waitlist_count += row.waitlist_count || 0;
+    sourceMap[s].waitlist_people += row.waitlist_people || 0;
+    sourceMap[s].checkin_count += row.checkin_count || 0;
+    sourceMap[s].checkin_people += row.checkin_people || 0;
+  }
+
+  for (const row of groupBySource) {
+    const s = row.source || 'web';
+    if (!sourceMap[s]) {
+      sourceMap[s] = {
+        source: s,
+        source_name: sourceLabels[s] || s,
+        reservation_count: 0,
+        reservation_people: 0,
+        group_count: 0,
+        group_people: 0,
+        cancel_count: 0,
+        cancel_people: 0,
+        waitlist_count: 0,
+        waitlist_people: 0,
+        checkin_count: 0,
+        checkin_people: 0
+      };
+    }
+    sourceMap[s].group_count += row.group_count || 0;
+    sourceMap[s].group_people += row.group_people || 0;
+    sourceMap[s].cancel_count += row.group_cancel_count || 0;
+    sourceMap[s].cancel_people += row.group_cancel_people || 0;
+    sourceMap[s].checkin_people += row.group_checkin_people || 0;
+  }
+
+  const breakdown = Object.values(sourceMap).map(item => ({
+    ...item,
+    total_reservations: item.reservation_count + item.group_count,
+    total_people: item.reservation_people + item.group_people,
+    total_cancel_count: item.cancel_count,
+    total_cancel_people: item.cancel_people,
+    total_checkin_people: item.checkin_people
+  }));
+
+  const summary = breakdown.reduce((acc: any, item: any) => {
+    acc.reservation_count += item.reservation_count;
+    acc.reservation_people += item.reservation_people;
+    acc.group_count += item.group_count;
+    acc.group_people += item.group_people;
+    acc.cancel_count += item.cancel_count;
+    acc.cancel_people += item.cancel_people;
+    acc.waitlist_count += item.waitlist_count;
+    acc.waitlist_people += item.waitlist_people;
+    acc.checkin_count += item.checkin_count;
+    acc.checkin_people += item.checkin_people;
+    return acc;
+  }, {
+    reservation_count: 0, reservation_people: 0,
+    group_count: 0, group_people: 0,
+    cancel_count: 0, cancel_people: 0,
+    waitlist_count: 0, waitlist_people: 0,
+    checkin_count: 0, checkin_people: 0
+  });
+
+  successResponse(res, {
+    summary: {
+      ...summary,
+      total_reservations: summary.reservation_count + summary.group_count,
+      total_people: summary.reservation_people + summary.group_people
+    },
+    breakdown,
+    date_range: { start_date: startDate, end_date: endDate },
+    venue_id: venue_id || null
+  });
+});
+
+export const checkQuotaReconciliation = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { venue_id, date } = req.query;
+
+  let venueCondition = '';
+  let params: any[] = [];
+
+  if (venue_id) {
+    venueCondition += ' AND ts.venue_id = ?';
+    params.push(venue_id);
+  }
+  if (date) {
+    venueCondition += ' AND ts.date = ?';
+    params.push(date);
+  }
+
+  const timeSlots = await all(
+    `SELECT ts.id, ts.venue_id, ts.date, ts.start_time, ts.end_time,
+            ts.total_quota, ts.reserved_count as stored_reserved, ts.waitlist_count as stored_waitlist
+     FROM time_slots ts
+     WHERE 1=1 ${venueCondition}
+     ORDER BY ts.venue_id, ts.date, ts.start_time`,
+    params
+  );
+
+  const slotDetails = [];
+  let slotMismatchCount = 0;
+
+  for (const ts of timeSlots) {
+    const reservedActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [ts.id]
+    );
+    const groupReservedActual = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE time_slot_id = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [ts.id]
+    );
+    const waitlistActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status = 'confirmed' AND is_waitlist = 1`,
+      [ts.id]
+    );
+
+    const calcReserved = (reservedActual?.total || 0) + (groupReservedActual?.total || 0);
+    const calcWaitlist = waitlistActual?.total || 0;
+    const mismatchReserved = calcReserved !== ts.stored_reserved;
+    const mismatchWaitlist = calcWaitlist !== ts.stored_waitlist;
+
+    if (mismatchReserved || mismatchWaitlist) {
+      slotMismatchCount++;
+    }
+
+    slotDetails.push({
+      time_slot_id: ts.id,
+      venue_id: ts.venue_id,
+      date: ts.date,
+      time: `${ts.start_time}-${ts.end_time}`,
+      total_quota: ts.total_quota,
+      stored_reserved: ts.stored_reserved,
+      calc_reserved: calcReserved,
+      reserved_diff: calcReserved - ts.stored_reserved,
+      stored_waitlist: ts.stored_waitlist,
+      calc_waitlist: calcWaitlist,
+      waitlist_diff: calcWaitlist - ts.stored_waitlist,
+      mismatch: mismatchReserved || mismatchWaitlist
+    });
+  }
+
+  let dateCondition = '';
+  let dateParams: any[] = [];
+  if (venue_id) {
+    dateCondition += ' AND venue_id = ?';
+    dateParams.push(venue_id);
+  }
+  if (date) {
+    dateCondition += ' AND date = ?';
+    dateParams.push(date);
+  }
+
+  const calendarSettings = await all(
+    `SELECT cs.venue_id, cs.date, cs.daily_limit, v.name as venue_name
+     FROM calendar_settings cs
+     LEFT JOIN venues v ON cs.venue_id = v.id
+     WHERE 1=1 ${dateCondition}
+     ORDER BY cs.venue_id, cs.date`,
+    dateParams
+  );
+
+  const dailyDetails = [];
+  let dailyMismatchCount = 0;
+
+  for (const cs of calendarSettings) {
+    const personDay = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE venue_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [cs.venue_id, cs.date]
+    );
+    const groupDay = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE venue_id = ? AND date = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [cs.venue_id, cs.date]
+    );
+    const calcUsed = (personDay?.total || 0) + (groupDay?.total || 0);
+
+    dailyDetails.push({
+      venue_id: cs.venue_id,
+      venue_name: cs.venue_name,
+      date: cs.date,
+      daily_limit: cs.daily_limit || null,
+      calc_used: calcUsed,
+      remaining: cs.daily_limit ? Math.max(0, cs.daily_limit - calcUsed) : null
+    });
+  }
+
+  const activities = await all(
+    `SELECT a.id, a.title, a.max_participants, a.registered_count as stored_registered, a.waitlist_count as stored_waitlist
+     FROM activities a
+     WHERE a.max_participants IS NOT NULL`,
+    []
+  );
+
+  const activityDetails = [];
+  let activityMismatchCount = 0;
+
+  for (const a of activities) {
+    const regActual = await get(
+      `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+       WHERE activity_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [a.id]
+    );
+    const waitActual = await get(
+      `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+       WHERE activity_id = ? AND status = 'registered' AND is_waitlist = 1`,
+      [a.id]
+    );
+    const calcReg = regActual?.total || 0;
+    const calcWait = waitActual?.total || 0;
+    const mismatchR = calcReg !== a.stored_registered;
+    const mismatchW = calcWait !== a.stored_waitlist;
+
+    if (mismatchR || mismatchW) {
+      activityMismatchCount++;
+    }
+
+    activityDetails.push({
+      activity_id: a.id,
+      title: a.title,
+      max_participants: a.max_participants,
+      stored_registered: a.stored_registered,
+      calc_registered: calcReg,
+      registered_diff: calcReg - a.stored_registered,
+      stored_waitlist: a.stored_waitlist,
+      calc_waitlist: calcWait,
+      waitlist_diff: calcWait - a.stored_waitlist,
+      mismatch: mismatchR || mismatchW
+    });
+  }
+
+  successResponse(res, {
+    summary: {
+      total_slots: slotDetails.length,
+      slot_mismatch: slotMismatchCount,
+      total_activities: activityDetails.length,
+      activity_mismatch: activityMismatchCount
+    },
+    time_slots: slotDetails,
+    daily_limits: dailyDetails,
+    activities: activityDetails
+  });
+});
+
+export const fixQuotaReconciliation = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const operatorId = req.user!.id;
+  const { venue_id, date, fix_activities = true } = req.body;
+
+  let venueCondition = '';
+  let params: any[] = [];
+
+  if (venue_id) {
+    venueCondition += ' AND ts.venue_id = ?';
+    params.push(venue_id);
+  }
+  if (date) {
+    venueCondition += ' AND ts.date = ?';
+    params.push(date);
+  }
+
+  const timeSlots = await all(
+    `SELECT ts.id, ts.reserved_count, ts.waitlist_count FROM time_slots ts WHERE 1=1 ${venueCondition}`,
+    params
+  );
+
+  let fixedSlotCount = 0;
+  const fixLogs: string[] = [];
+
+  for (const ts of timeSlots) {
+    const reservedActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [ts.id]
+    );
+    const groupReservedActual = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE time_slot_id = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [ts.id]
+    );
+    const waitlistActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status = 'confirmed' AND is_waitlist = 1`,
+      [ts.id]
+    );
+
+    const calcReserved = (reservedActual?.total || 0) + (groupReservedActual?.total || 0);
+    const calcWaitlist = waitlistActual?.total || 0;
+
+    if (calcReserved !== ts.reserved_count || calcWaitlist !== ts.waitlist_count) {
+      await run(
+        'UPDATE time_slots SET reserved_count = ?, waitlist_count = ? WHERE id = ?',
+        [calcReserved, calcWaitlist, ts.id]
+      );
+      fixedSlotCount++;
+      fixLogs.push(`时段#${ts.id}: reserved ${ts.reserved_count}→${calcReserved}, waitlist ${ts.waitlist_count}→${calcWaitlist}`);
+    }
+  }
+
+  let fixedActivityCount = 0;
+
+  if (fix_activities) {
+    const activities = await all(
+      `SELECT a.id, a.registered_count, a.waitlist_count FROM activities a WHERE a.max_participants IS NOT NULL`,
+      []
+    );
+
+    for (const a of activities) {
+      const regActual = await get(
+        `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+         WHERE activity_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+        [a.id]
+      );
+      const waitActual = await get(
+        `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+         WHERE activity_id = ? AND status = 'registered' AND is_waitlist = 1`,
+        [a.id]
+      );
+      const calcReg = regActual?.total || 0;
+      const calcWait = waitActual?.total || 0;
+
+      if (calcReg !== a.registered_count || calcWait !== a.waitlist_count) {
+        await run(
+          'UPDATE activities SET registered_count = ?, waitlist_count = ? WHERE id = ?',
+          [calcReg, calcWait, a.id]
+        );
+        fixedActivityCount++;
+        fixLogs.push(`活动#${a.id}: registered ${a.registered_count}→${calcReg}, waitlist ${a.waitlist_count}→${calcWait}`);
+      }
+    }
+  }
+
+  await run(
+    `INSERT INTO operation_logs (user_id, module, action, params, ip) 
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      operatorId,
+      'quota',
+      'reconciliation_fix',
+      JSON.stringify({
+        fixed_slots: fixedSlotCount,
+        fixed_activities: fixedActivityCount,
+        logs: fixLogs.slice(0, 50),
+        filters: { venue_id: venue_id || null, date: date || null }
+      }),
+      req.ip || ''
+    ]
+  );
+
+  successResponse(res, {
+    fixed_slots: fixedSlotCount,
+    fixed_activities: fixedActivityCount,
+    fix_logs: fixLogs
+  }, '名额修复完成');
 });

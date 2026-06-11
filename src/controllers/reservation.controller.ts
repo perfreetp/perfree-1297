@@ -14,6 +14,15 @@ export const createReservation = asyncHandler(async (req: AuthRequest, res: Resp
     throw new ApiError(400, '时段、姓名、手机号为必填项', 'invalid_params');
   }
 
+  if (visitor_count !== undefined && visitor_count !== null) {
+    if (typeof visitor_count !== 'number' || !Number.isInteger(visitor_count) || visitor_count <= 0) {
+      throw new ApiError(400, `人数不合法：${visitor_count}，必须是正整数`, 'invalid_visitor_count');
+    }
+    if (visitor_count > 50) {
+      throw new ApiError(400, `人数不合法：超过上限(50人)，如需团体预约请走团体通道`, 'invalid_visitor_count');
+    }
+  }
+
   const timeSlot = await get('SELECT * FROM time_slots WHERE id = ?', [time_slot_id]);
   if (!timeSlot) {
     throw new ApiError(404, '时段不存在', 'not_found');

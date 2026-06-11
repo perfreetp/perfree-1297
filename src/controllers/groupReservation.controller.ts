@@ -21,6 +21,14 @@ export const createGroupReservation = asyncHandler(async (req: AuthRequest, res:
     throw new ApiError(400, '缺少必要参数', 'invalid_params');
   }
 
+  if (typeof total_people !== 'number' || !Number.isInteger(total_people) || total_people <= 0) {
+    throw new ApiError(400, `人数不合法：${total_people}，必须是正整数`, 'invalid_visitor_count');
+  }
+
+  if (total_people > 500) {
+    throw new ApiError(400, `人数不合法：超过上限(500人)`, 'invalid_visitor_count');
+  }
+
   if (total_people < 5) {
     throw new ApiError(400, '团体预约至少需要5人', 'invalid_params');
   }
@@ -208,6 +216,10 @@ export const auditGroupReservation = asyncHandler(async (req: AuthRequest, res: 
   const groupReservation = await get('SELECT * FROM group_reservations WHERE id = ?', [id]);
   if (!groupReservation) {
     throw new ApiError(404, '团体预约不存在', 'not_found');
+  }
+
+  if (groupReservation.status === 'cancelled') {
+    throw new ApiError(400, '该预约已取消，无法审核', 'invalid_operation');
   }
 
   if (groupReservation.audit_status !== 'pending') {
