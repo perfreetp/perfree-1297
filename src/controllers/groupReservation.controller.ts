@@ -17,7 +17,7 @@ export const createGroupReservation = asyncHandler(async (req: AuthRequest, res:
     source
   } = req.body;
 
-  if (!time_slot_id || !group_name || !contact_person || !contact_phone || !total_people) {
+  if (!time_slot_id || !group_name || !contact_person || !contact_phone || total_people === undefined || total_people === null) {
     throw new ApiError(400, '缺少必要参数', 'invalid_params');
   }
 

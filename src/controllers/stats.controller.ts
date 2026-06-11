@@ -4,6 +4,7 @@ import { successResponse, ApiError, asyncHandler } from '../utils/response';
 import { AuthRequest } from '../middlewares/auth.middleware';
 import { sendMessage } from '../services/message.service';
 import dayjs from 'dayjs';
+import * as XLSX from 'xlsx';
 
 export const getDashboardStats = asyncHandler(async (req: AuthRequest, res: Response) => {
   const { start_date, end_date } = req.query;
@@ -471,19 +472,19 @@ export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Res
 
   const personalBySource = await all(
     `SELECT 
-       r.source,
+       CASE WHEN r.source = 'admin' THEN 'backend' ELSE COALESCE(r.source, 'web') END as norm_source,
        COUNT(*) as total_count,
-       SUM(CASE WHEN r.is_waitlist = 0 THEN 1 ELSE 0 END) as reservation_count,
-       SUM(CASE WHEN r.is_waitlist = 0 THEN r.visitor_count ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN r.is_waitlist = 0 AND r.status != 'cancelled' THEN 1 ELSE 0 END) as reservation_count,
+       SUM(CASE WHEN r.is_waitlist = 0 AND r.status != 'cancelled' THEN r.visitor_count ELSE 0 END) as reservation_people,
        SUM(CASE WHEN r.status = 'cancelled' THEN 1 ELSE 0 END) as cancel_count,
        SUM(CASE WHEN r.status = 'cancelled' THEN r.visitor_count ELSE 0 END) as cancel_people,
-       SUM(CASE WHEN r.is_waitlist = 1 THEN 1 ELSE 0 END) as waitlist_count,
-       SUM(CASE WHEN r.is_waitlist = 1 THEN r.visitor_count ELSE 0 END) as waitlist_people,
+       SUM(CASE WHEN r.is_waitlist = 1 AND r.status != 'cancelled' THEN 1 ELSE 0 END) as waitlist_count,
+       SUM(CASE WHEN r.is_waitlist = 1 AND r.status != 'cancelled' THEN r.visitor_count ELSE 0 END) as waitlist_people,
        SUM(CASE WHEN r.checked_in = 1 THEN 1 ELSE 0 END) as checkin_count,
        SUM(CASE WHEN r.checked_in = 1 THEN r.visitor_count ELSE 0 END) as checkin_people
      FROM reservations r
      WHERE r.date >= ? AND r.date <= ?${venueCondition}
-     GROUP BY r.source`,
+     GROUP BY norm_source`,
     params
   );
 
@@ -496,15 +497,15 @@ export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Res
 
   const groupBySource = await all(
     `SELECT 
-       gr.source,
-       COUNT(*) as group_count,
-       SUM(gr.total_people) as group_people,
+       CASE WHEN gr.source = 'admin' THEN 'backend' ELSE COALESCE(gr.source, 'web') END as norm_source,
+       SUM(CASE WHEN gr.status != 'cancelled' THEN 1 ELSE 0 END) as group_count,
+       SUM(CASE WHEN gr.status != 'cancelled' THEN gr.total_people ELSE 0 END) as group_people,
        SUM(CASE WHEN gr.status = 'cancelled' THEN 1 ELSE 0 END) as group_cancel_count,
        SUM(CASE WHEN gr.status = 'cancelled' THEN gr.total_people ELSE 0 END) as group_cancel_people,
        SUM(CASE WHEN gr.checked_in_count IS NOT NULL THEN gr.checked_in_count ELSE 0 END) as group_checkin_people
      FROM group_reservations gr
      WHERE gr.date >= ? AND gr.date <= ?${groupVenueCondition}
-     GROUP BY gr.source`,
+     GROUP BY norm_source`,
     groupParams
   );
 
@@ -513,8 +514,7 @@ export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Res
     web: '官网',
     miniapp: '小程序',
     kiosk: '自助机',
-    backend: '后台管理',
-    admin: '后台管理'
+    backend: '后台管理'
   };
 
   for (const label of ['web', 'miniapp', 'kiosk', 'backend']) {
@@ -535,7 +535,7 @@ export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Res
   }
 
   for (const row of personalBySource) {
-    const s = row.source || 'web';
+    const s = row.norm_source || 'web';
     if (!sourceMap[s]) {
       sourceMap[s] = {
         source: s,
@@ -563,7 +563,7 @@ export const getSourceBreakdown = asyncHandler(async (req: AuthRequest, res: Res
   }
 
   for (const row of groupBySource) {
-    const s = row.source || 'web';
+    const s = row.norm_source || 'web';
     if (!sourceMap[s]) {
       sourceMap[s] = {
         source: s,
@@ -909,4 +909,574 @@ export const fixQuotaReconciliation = asyncHandler(async (req: AuthRequest, res:
     fixed_activities: fixedActivityCount,
     fix_logs: fixLogs
   }, '名额修复完成');
+});
+
+const normalizeSource = (s: string | null | undefined): string => {
+  if (!s) return 'web';
+  if (s === 'admin') return 'backend';
+  return s;
+};
+const sourceNameMap: Record<string, string> = {
+  web: '官网',
+  miniapp: '小程序',
+  kiosk: '自助机',
+  backend: '后台管理'
+};
+
+export const getMultidimStats = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { venue_id, start_date, end_date, source, type } = req.query;
+
+  const startDate = start_date || dayjs().subtract(30, 'day').format('YYYY-MM-DD');
+  const endDate = end_date || dayjs().format('YYYY-MM-DD');
+
+  let venueCondition = '';
+  let params: any[] = [startDate, endDate];
+
+  if (venue_id) {
+    venueCondition = ' AND venue_id = ?';
+    params.push(venue_id);
+  }
+
+  const personalRows = await all(
+    `SELECT 
+       date,
+       venue_id,
+       CASE WHEN source = 'admin' THEN 'backend' ELSE COALESCE(source, 'web') END as norm_source,
+       'personal' as reserve_type,
+       SUM(CASE WHEN is_waitlist = 0 AND status != 'cancelled' THEN visitor_count ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN status = 'cancelled' THEN visitor_count ELSE 0 END) as cancel_people,
+       SUM(CASE WHEN is_waitlist = 1 AND status != 'cancelled' THEN visitor_count ELSE 0 END) as waitlist_people,
+       SUM(CASE WHEN checked_in = 1 THEN visitor_count ELSE 0 END) as checkin_people,
+       COUNT(*) as total_rows
+     FROM reservations
+     WHERE date >= ? AND date <= ?${venueCondition}
+     GROUP BY date, venue_id, norm_source`,
+    params
+  );
+
+  const groupVenueCondition = venue_condition_safe(venueCondition, 'gr.');
+  const groupRows = await all(
+    `SELECT 
+       gr.date,
+       gr.venue_id,
+       CASE WHEN gr.source = 'admin' THEN 'backend' ELSE COALESCE(gr.source, 'web') END as norm_source,
+       'group' as reserve_type,
+       SUM(CASE WHEN gr.status != 'cancelled' THEN gr.total_people ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN gr.status = 'cancelled' THEN gr.total_people ELSE 0 END) as cancel_people,
+       0 as waitlist_people,
+       SUM(CASE WHEN gr.checked_in_count IS NOT NULL THEN gr.checked_in_count ELSE 0 END) as checkin_people,
+       COUNT(*) as total_rows
+     FROM group_reservations gr
+     WHERE gr.date >= ? AND gr.date <= ?${groupVenueCondition}
+     GROUP BY gr.date, gr.venue_id, norm_source`,
+    params
+  );
+
+  const venues = await all('SELECT id, name FROM venues', []);
+  const venueMap: Record<number, string> = {};
+  venues.forEach((v: any) => { venueMap[v.id] = v.name; });
+
+  const detailMap: Record<string, any> = {};
+  const keyOf = (d: string, vid: number, s: string, t: string) => `${d}|${vid}|${s}|${t}`;
+
+  for (const row of [...personalRows, ...groupRows]) {
+    const k = keyOf(row.date, row.venue_id, row.norm_source, row.reserve_type);
+    if (!detailMap[k]) {
+      detailMap[k] = {
+        date: row.date,
+        venue_id: row.venue_id,
+        venue_name: venueMap[row.venue_id] || '未知场馆',
+        source: row.norm_source,
+        source_name: sourceNameMap[row.norm_source] || row.norm_source,
+        reserve_type: row.reserve_type === 'personal' ? '个人预约' : '团体预约',
+        reservation_people: 0,
+        cancel_people: 0,
+        waitlist_people: 0,
+        checkin_people: 0,
+        total_records: 0
+      };
+    }
+    detailMap[k].reservation_people += row.reservation_people || 0;
+    detailMap[k].cancel_people += row.cancel_people || 0;
+    detailMap[k].waitlist_people += row.waitlist_people || 0;
+    detailMap[k].checkin_people += row.checkin_people || 0;
+    detailMap[k].total_records += row.total_rows || 0;
+  }
+
+  let detailList = Object.values(detailMap);
+  if (source) detailList = detailList.filter(d => d.source === source);
+  if (type) {
+    const tMap: Record<string, string> = { personal: '个人预约', group: '团体预约' };
+    if (tMap[type as string]) detailList = detailList.filter(d => d.reserve_type === tMap[type as string]);
+  }
+  detailList.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0) || (a.venue_id - b.venue_id));
+
+  const summary = detailList.reduce((acc: any, d: any) => {
+    acc.reservation_people += d.reservation_people;
+    acc.cancel_people += d.cancel_people;
+    acc.waitlist_people += d.waitlist_people;
+    acc.checkin_people += d.checkin_people;
+    acc.total_records += d.total_records;
+    return acc;
+  }, { reservation_people: 0, cancel_people: 0, waitlist_people: 0, checkin_people: 0, total_records: 0 });
+
+  successResponse(res, {
+    summary,
+    rows: detailList,
+    date_range: { start_date: startDate, end_date: endDate },
+    filters: { venue_id: venue_id || null, source: source || null, type: type || null }
+  });
+});
+
+function venue_condition_safe(cond: string, prefix: string): string {
+  return cond.replace(' venue_id = ', ` ${prefix}venue_id = `);
+}
+
+export const exportMultidimStats = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { venue_id, start_date, end_date, source, type } = req.query;
+
+  const startDate = start_date || dayjs().subtract(30, 'day').format('YYYY-MM-DD');
+  const endDate = end_date || dayjs().format('YYYY-MM-DD');
+
+  let venueCondition = '';
+  let params: any[] = [startDate, endDate];
+
+  if (venue_id) {
+    venueCondition = ' AND venue_id = ?';
+    params.push(venue_id);
+  }
+
+  const personalRows = await all(
+    `SELECT 
+       date,
+       venue_id,
+       CASE WHEN source = 'admin' THEN 'backend' ELSE COALESCE(source, 'web') END as norm_source,
+       'personal' as reserve_type,
+       SUM(CASE WHEN is_waitlist = 0 AND status != 'cancelled' THEN visitor_count ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN status = 'cancelled' THEN visitor_count ELSE 0 END) as cancel_people,
+       SUM(CASE WHEN is_waitlist = 1 AND status != 'cancelled' THEN visitor_count ELSE 0 END) as waitlist_people,
+       SUM(CASE WHEN checked_in = 1 THEN visitor_count ELSE 0 END) as checkin_people,
+       COUNT(*) as total_rows
+     FROM reservations
+     WHERE date >= ? AND date <= ?${venueCondition}
+     GROUP BY date, venue_id, norm_source`,
+    params
+  );
+
+  const groupVenueCondition = venue_condition_safe(venueCondition, 'gr.');
+  const groupRows = await all(
+    `SELECT 
+       gr.date,
+       gr.venue_id,
+       CASE WHEN gr.source = 'admin' THEN 'backend' ELSE COALESCE(gr.source, 'web') END as norm_source,
+       'group' as reserve_type,
+       SUM(CASE WHEN gr.status != 'cancelled' THEN gr.total_people ELSE 0 END) as reservation_people,
+       SUM(CASE WHEN gr.status = 'cancelled' THEN gr.total_people ELSE 0 END) as cancel_people,
+       0 as waitlist_people,
+       SUM(CASE WHEN gr.checked_in_count IS NOT NULL THEN gr.checked_in_count ELSE 0 END) as checkin_people,
+       COUNT(*) as total_rows
+     FROM group_reservations gr
+     WHERE gr.date >= ? AND gr.date <= ?${groupVenueCondition}
+     GROUP BY gr.date, gr.venue_id, norm_source`,
+    params
+  );
+
+  const venues = await all('SELECT id, name FROM venues', []);
+  const venueMap: Record<number, string> = {};
+  venues.forEach((v: any) => { venueMap[v.id] = v.name; });
+
+  const detailMap: Record<string, any> = {};
+  const keyOf = (d: string, vid: number, s: string, t: string) => `${d}|${vid}|${s}|${t}`;
+
+  for (const row of [...personalRows, ...groupRows]) {
+    const k = keyOf(row.date, row.venue_id, row.norm_source, row.reserve_type);
+    if (!detailMap[k]) {
+      detailMap[k] = {
+        date: row.date,
+        venue_id: row.venue_id,
+        venue_name: venueMap[row.venue_id] || '未知场馆',
+        source: row.norm_source,
+        source_name: sourceNameMap[row.norm_source] || row.norm_source,
+        reserve_type: row.reserve_type === 'personal' ? '个人预约' : '团体预约',
+        reservation_people: 0,
+        cancel_people: 0,
+        waitlist_people: 0,
+        checkin_people: 0,
+        total_records: 0
+      };
+    }
+    detailMap[k].reservation_people += row.reservation_people || 0;
+    detailMap[k].cancel_people += row.cancel_people || 0;
+    detailMap[k].waitlist_people += row.waitlist_people || 0;
+    detailMap[k].checkin_people += row.checkin_people || 0;
+    detailMap[k].total_records += row.total_rows || 0;
+  }
+
+  let detailList = Object.values(detailMap);
+  if (source) detailList = detailList.filter(d => d.source === source);
+  if (type) {
+    const tMap: Record<string, string> = { personal: '个人预约', group: '团体预约' };
+    if (tMap[type as string]) detailList = detailList.filter(d => d.reserve_type === tMap[type as string]);
+  }
+  detailList.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0) || (a.venue_id - b.venue_id));
+
+  const summary = detailList.reduce((acc: any, d: any) => {
+    acc.reservation_people += d.reservation_people;
+    acc.cancel_people += d.cancel_people;
+    acc.waitlist_people += d.waitlist_people;
+    acc.checkin_people += d.checkin_people;
+    acc.total_records += d.total_records;
+    return acc;
+  }, { reservation_people: 0, cancel_people: 0, waitlist_people: 0, checkin_people: 0, total_records: 0 });
+
+  const exportRows = [
+    {
+      '日期': '汇总',
+      '场馆ID': '-',
+      '场馆名称': '-',
+      '来源编码': '-',
+      '来源名称': '合计',
+      '预约类型': '全部',
+      '有效预约人数': summary.reservation_people,
+      '取消人数': summary.cancel_people,
+      '候补人数': summary.waitlist_people,
+      '核销人数': summary.checkin_people,
+      '记录数': summary.total_records
+    },
+    ...detailList.map((d: any) => ({
+      '日期': d.date,
+      '场馆ID': d.venue_id,
+      '场馆名称': d.venue_name,
+      '来源编码': d.source,
+      '来源名称': d.source_name,
+      '预约类型': d.reserve_type,
+      '有效预约人数': d.reservation_people,
+      '取消人数': d.cancel_people,
+      '候补人数': d.waitlist_people,
+      '核销人数': d.checkin_people,
+      '记录数': d.total_records
+    }))
+  ];
+
+  const worksheet = XLSX.utils.json_to_sheet(exportRows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, '多维汇总');
+  const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+
+  const fileName = encodeURIComponent(`预约多维汇总_${startDate}_${endDate}.xlsx`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+  res.send(buffer);
+});
+
+export const batchCheckQuota = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const { start_date, end_date, venue_ids } = req.query;
+
+  const startDate = start_date || dayjs().subtract(14, 'day').format('YYYY-MM-DD');
+  const endDate = end_date || dayjs().add(14, 'day').format('YYYY-MM-DD');
+
+  let venueCondition = '';
+  let params: any[] = [startDate, endDate];
+  const venueIdArr: number[] = [];
+
+  if (venue_ids && typeof venue_ids === 'string') {
+    venueIdArr.push(...venue_ids.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)));
+  }
+  if (venueIdArr.length > 0) {
+    const ph = venueIdArr.map(() => '?').join(',');
+    venueCondition = ` AND venue_id IN (${ph})`;
+    params.push(...venueIdArr);
+  }
+
+  const timeSlots = await all(
+    `SELECT ts.id, ts.venue_id, ts.date, ts.start_time, ts.end_time,
+            ts.total_quota, ts.reserved_count as stored_reserved, ts.waitlist_count as stored_waitlist
+     FROM time_slots ts
+     WHERE ts.date >= ? AND ts.date <= ?${venueCondition}
+     ORDER BY ts.date, ts.venue_id, ts.start_time`,
+    params
+  );
+
+  const calendarSettings = await all(
+    `SELECT cs.venue_id, cs.date, cs.daily_limit, v.name as venue_name
+     FROM calendar_settings cs
+     LEFT JOIN venues v ON cs.venue_id = v.id
+     WHERE cs.date >= ? AND cs.date <= ?${venueCondition}
+     ORDER BY cs.date, cs.venue_id`,
+    params
+  );
+
+  const byDate: Record<string, any> = {};
+  const dateKey = (d: string, vid: number) => `${d}|${vid}`;
+
+  for (const ts of timeSlots) {
+    const reservedActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [ts.id]
+    );
+    const groupReservedActual = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE time_slot_id = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [ts.id]
+    );
+    const waitlistActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status = 'confirmed' AND is_waitlist = 1`,
+      [ts.id]
+    );
+
+    const calcReserved = (reservedActual?.total || 0) + (groupReservedActual?.total || 0);
+    const calcWaitlist = waitlistActual?.total || 0;
+    const mismatch = calcReserved !== ts.stored_reserved || calcWaitlist !== ts.stored_waitlist;
+
+    const slotInfo = {
+      time_slot_id: ts.id,
+      time: `${ts.start_time}-${ts.end_time}`,
+      total_quota: ts.total_quota,
+      stored_reserved: ts.stored_reserved,
+      calc_reserved: calcReserved,
+      reserved_diff: calcReserved - ts.stored_reserved,
+      stored_waitlist: ts.stored_waitlist,
+      calc_waitlist: calcWaitlist,
+      waitlist_diff: calcWaitlist - ts.stored_waitlist,
+      mismatch
+    };
+
+    const key = dateKey(ts.date, ts.venue_id);
+    if (!byDate[key]) {
+      byDate[key] = {
+        date: ts.date,
+        venue_id: ts.venue_id,
+        venue_name: '',
+        time_slots: [],
+        slot_mismatch_count: 0,
+        daily_limit: null,
+        daily_stored: null,
+        daily_calc_used: null,
+        daily_diff: null,
+        daily_mismatch: false
+      };
+    }
+    byDate[key].time_slots.push(slotInfo);
+    if (mismatch) byDate[key].slot_mismatch_count++;
+  }
+
+  for (const cs of calendarSettings) {
+    const key = dateKey(cs.date, cs.venue_id);
+    if (!byDate[key]) {
+      byDate[key] = {
+        date: cs.date,
+        venue_id: cs.venue_id,
+        venue_name: cs.venue_name,
+        time_slots: [],
+        slot_mismatch_count: 0,
+        daily_limit: cs.daily_limit,
+        daily_stored: null,
+        daily_calc_used: null,
+        daily_diff: null,
+        daily_mismatch: false
+      };
+    }
+    byDate[key].venue_name = cs.venue_name;
+
+    if (cs.daily_limit) {
+      const personDay = await get(
+        `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+         WHERE venue_id = ? AND date = ? AND status != 'cancelled' AND is_waitlist = 0`,
+        [cs.venue_id, cs.date]
+      );
+      const groupDay = await get(
+        `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+         WHERE venue_id = ? AND date = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+        [cs.venue_id, cs.date]
+      );
+      const calcUsed = (personDay?.total || 0) + (groupDay?.total || 0);
+
+      byDate[key].daily_limit = cs.daily_limit;
+      byDate[key].daily_calc_used = calcUsed;
+      byDate[key].daily_stored = null;
+      byDate[key].daily_diff = null;
+    }
+  }
+
+  const dailyList = Object.values(byDate).sort(
+    (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0) || (a.venue_id - b.venue_id)
+  );
+
+  const totals = dailyList.reduce((acc: any, d: any) => {
+    acc.total_days++;
+    acc.total_slots += d.time_slots.length;
+    acc.slot_mismatch += d.slot_mismatch_count;
+    if (d.slot_mismatch_count > 0) acc.days_with_slot_mismatch++;
+    return acc;
+  }, { total_days: 0, total_slots: 0, slot_mismatch: 0, days_with_slot_mismatch: 0 });
+
+  successResponse(res, {
+    summary: totals,
+    daily_details: dailyList,
+    date_range: { start_date: startDate, end_date: endDate },
+    venue_ids: venueIdArr.length > 0 ? venueIdArr : null
+  });
+});
+
+export const batchFixQuota = asyncHandler(async (req: AuthRequest, res: Response) => {
+  const operatorId = req.user!.id;
+  const { start_date, end_date, venue_ids, fix_activities = true } = req.body;
+
+  const startDate = start_date || dayjs().subtract(14, 'day').format('YYYY-MM-DD');
+  const endDate = end_date || dayjs().add(14, 'day').format('YYYY-MM-DD');
+
+  let venueCondition = '';
+  let params: any[] = [startDate, endDate];
+  const venueIdArr: number[] = [];
+
+  if (venue_ids && Array.isArray(venue_ids)) {
+    venueIdArr.push(...venue_ids.map((n: any) => Number(n)).filter((n: number) => !isNaN(n)));
+  } else if (venue_ids && typeof venue_ids === 'string') {
+    venueIdArr.push(...venue_ids.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)));
+  }
+  if (venueIdArr.length > 0) {
+    const ph = venueIdArr.map(() => '?').join(',');
+    venueCondition = ` AND venue_id IN (${ph})`;
+    params.push(...venueIdArr);
+  }
+
+  const timeSlots = await all(
+    `SELECT ts.id, ts.venue_id, ts.date, ts.reserved_count, ts.waitlist_count
+     FROM time_slots ts
+     WHERE ts.date >= ? AND ts.date <= ?${venueCondition}
+     ORDER BY ts.date, ts.venue_id`,
+    params
+  );
+
+  const byDate: Record<string, any> = {};
+  const dateKey = (d: string, vid: number) => `${d}|${vid}`;
+  const fixLogsByDate: Record<string, string[]> = {};
+  let fixedSlotCount = 0;
+
+  for (const ts of timeSlots) {
+    const reservedActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+      [ts.id]
+    );
+    const groupReservedActual = await get(
+      `SELECT COALESCE(SUM(total_people), 0) as total FROM group_reservations 
+       WHERE time_slot_id = ? AND status NOT IN ('cancelled', 'rejected') AND audit_status != 'rejected'`,
+      [ts.id]
+    );
+    const waitlistActual = await get(
+      `SELECT COALESCE(SUM(visitor_count), 0) as total FROM reservations 
+       WHERE time_slot_id = ? AND status = 'confirmed' AND is_waitlist = 1`,
+      [ts.id]
+    );
+
+    const calcReserved = (reservedActual?.total || 0) + (groupReservedActual?.total || 0);
+    const calcWaitlist = waitlistActual?.total || 0;
+    const mismatch = calcReserved !== ts.reserved_count || calcWaitlist !== ts.waitlist_count;
+
+    const key = dateKey(ts.date, ts.venue_id);
+    if (!byDate[key]) {
+      byDate[key] = {
+        date: ts.date,
+        venue_id: ts.venue_id,
+        fixed_slots: 0,
+        slot_fix_details: []
+      };
+    }
+
+    if (mismatch) {
+      await run(
+        'UPDATE time_slots SET reserved_count = ?, waitlist_count = ? WHERE id = ?',
+        [calcReserved, calcWaitlist, ts.id]
+      );
+      fixedSlotCount++;
+      byDate[key].fixed_slots++;
+      const log = `时段#${ts.id}: reserved ${ts.reserved_count}→${calcReserved}, waitlist ${ts.waitlist_count}→${calcWaitlist}`;
+      byDate[key].slot_fix_details.push(log);
+      fixLogsByDate[key] = fixLogsByDate[key] || [];
+      fixLogsByDate[key].push(log);
+    }
+  }
+
+  let fixedActivityCount = 0;
+  const activityFixLogs: string[] = [];
+
+  if (fix_activities) {
+    const activities = await all(
+      `SELECT a.id, a.registered_count, a.waitlist_count FROM activities a WHERE a.max_participants IS NOT NULL`,
+      []
+    );
+
+    for (const a of activities) {
+      const regActual = await get(
+        `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+         WHERE activity_id = ? AND status != 'cancelled' AND is_waitlist = 0`,
+        [a.id]
+      );
+      const waitActual = await get(
+        `SELECT COALESCE(SUM(participant_count), 0) as total FROM activity_registrations 
+         WHERE activity_id = ? AND status = 'registered' AND is_waitlist = 1`,
+        [a.id]
+      );
+      const calcReg = regActual?.total || 0;
+      const calcWait = waitActual?.total || 0;
+
+      if (calcReg !== a.registered_count || calcWait !== a.waitlist_count) {
+        await run(
+          'UPDATE activities SET registered_count = ?, waitlist_count = ? WHERE id = ?',
+          [calcReg, calcWait, a.id]
+        );
+        fixedActivityCount++;
+        activityFixLogs.push(`活动#${a.id}: registered ${a.registered_count}→${calcReg}, waitlist ${a.waitlist_count}→${calcWait}`);
+      }
+    }
+  }
+
+  const dailyResultList = Object.values(byDate).sort(
+    (a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0) || (a.venue_id - b.venue_id)
+  );
+
+  const allFixLogs = Object.values(fixLogsByDate).flat();
+  await run(
+    `INSERT INTO operation_logs (user_id, module, action, params, ip) 
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      operatorId,
+      'quota',
+      'batch_reconciliation_fix',
+      JSON.stringify({
+        operator_id: operatorId,
+        date_range: { start_date: startDate, end_date: endDate },
+        venue_ids: venueIdArr.length > 0 ? venueIdArr : null,
+        fixed_slots: fixedSlotCount,
+        fixed_activities: fixedActivityCount,
+        days_count: dailyResultList.length,
+        daily_fixes: dailyResultList.map((d: any) => ({
+          date: d.date,
+          venue_id: d.venue_id,
+          fixed_slots: d.fixed_slots,
+          slot_details: d.slot_fix_details
+        })),
+        activity_fix_logs: activityFixLogs,
+        all_slot_fix_logs: allFixLogs.slice(0, 100)
+      }),
+      req.ip || ''
+    ]
+  );
+
+  successResponse(res, {
+    summary: {
+      fixed_slots: fixedSlotCount,
+      fixed_activities: fixedActivityCount,
+      days_checked: dailyResultList.length,
+      days_fixed: dailyResultList.filter((d: any) => d.fixed_slots > 0).length
+    },
+    daily_details: dailyResultList,
+    activity_fixes: activityFixLogs,
+    date_range: { start_date: startDate, end_date: endDate },
+    venue_ids: venueIdArr.length > 0 ? venueIdArr : null,
+    operation_log_recorded: true
+  }, '批量名额修复完成');
 });
